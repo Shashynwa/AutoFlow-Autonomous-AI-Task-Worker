@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -18,7 +19,7 @@ def save_invoice(invoice_id, company, amount, invoice_date, due_date):
         if not amt.is_finite() or amt < 0: raise ValueError('Invalid amount')
         date.fromisoformat(invoice_date); date.fromisoformat(due_date)
         if not invoice_id or not company: raise ValueError('Missing invoice ID or company')
-        with connect() as db:
+        with closing(connect()) as db, db:
             db.execute('INSERT INTO invoices(invoice_id,company,amount,invoice_date,due_date) VALUES(?,?,?,?,?)', (invoice_id,company,float(amt),invoice_date,due_date))
         return {'status':'success','invoice_id':invoice_id}
     except sqlite3.IntegrityError:
@@ -27,7 +28,7 @@ def save_invoice(invoice_id, company, amount, invoice_date, due_date):
         return {'status':'error','message':str(exc)}
 
 def get_invoice(invoice_id):
-    with connect() as db:
+    with closing(connect()) as db, db:
         row = db.execute('SELECT * FROM invoices WHERE invoice_id=?',(invoice_id,)).fetchone()
     if row is None: return {'status':'error','message':'Invoice not found'}
     data = dict(row)

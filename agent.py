@@ -1,99 +1,215 @@
+"""AutoFlow v0.2: restricted, auditable local invoice agent."""
 import json
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
 import requests
+
 from tools.file_tools import list_files, read_invoice
 from tools.database_tools import get_invoice
-from tools.invoice_tools import find_latest_invoice, process_invoice
+from tools.invoice_tools import find_latest_invoice, process_invoice, matching, extract_invoice_fields
 
 OLLAMA_URL = 'http://localhost:11434/api/chat'
 MODEL = 'qwen2.5:3b'
 MAX_STEPS = 12
-TOOLS = {'list_files':list_files,'read_invoice':read_invoice,'get_invoice':get_invoice,'find_latest_invoice':find_latest_invoice,'process_invoice':process_invoice}
-SYSTEM_PROMPT = '''You are AutoFlow, a tool-using office agent. Your task is to execute user requests, not merely explain them.
-Tools (call ONE at a time):
-list_files {}: list available PDFs.
-read_invoice {"filename":"INV-101.pdf"}: read a discovered PDF.
-get_invoice {"invoice_id":"INV-101"}: retrieve database record.
-find_latest_invoice {"company":"ABC Company"}: find latest PDF by invoice date.
-process_invoice {"filename":"INV-101.pdf"}: parse, save and independently verify a discovered PDF.
-To process latest company invoice: find_latest_invoice first, then process_invoice with returned filename.
-Never invent filenames, amounts, or observations. If an action fails, use feedback to recover.
-Reply with exactly one JSON object:
+LOG_DIR = Path(__file__).resolve().parent / 'logs'
+TOOLS = {'list_files': list_files, 'read_invoice': read_invoice, 'get_invoice': get_invoice,
+         'find_latest_invoice': find_latest_invoice, 'process_invoice': process_invoice}
+ARGUMENTS = {'list_files': {}, 'read_invoice': {'filename': str},
+             'get_invoice': {'invoice_id': str}, 'find_latest_invoice': {'company': str},
+             'process_invoice': {'filename': str}}
+SYSTEM_PROMPT = '''You are AutoFlow, a local tool-using office agent. Execute the user's task.
+Use one tool per response. Never invent file names or claim actions succeeded without tool evidence.
+Tools: list_files {}; read_invoice {"filename":"..."}; get_invoice {"invoice_id":"..."};
+find_latest_invoice {"company":"..."}; process_invoice {"filename":"..."}.
+For latest invoice requests, ALWAYS call find_latest_invoice(company) before process_invoice(filename).
+Reply with exactly one JSON object, either
 {"action":"tool","tool_name":"find_latest_invoice","arguments":{"company":"ABC Company"}}
-OR {"action":"finish","answer":"Summary grounded in observations"}.
-Do not claim a save succeeded without verified:true in the tool result.'''
+or {"action":"finish","answer":"A concise evidence-based summary"}.
+Do not treat a tool's success as proof that the original user goal is complete.
+If the tool reports an error, choose a recovery action or finish with an honest failure summary.'''
+
 
 def ask_llm(messages):
-    response = requests.post(OLLAMA_URL,json={'model':MODEL,'messages':messages,'stream':False,'format':'json','options':{'temperature':0,'num_ctx':4096}},timeout=240)
+    response = requests.post(OLLAMA_URL, json={'model': MODEL, 'messages': messages,
+        'stream': False, 'format': 'json', 'options': {'temperature': 0, 'num_ctx': 4096}}, timeout=120)
     response.raise_for_status()
     return json.loads(response.json()['message']['content'])
 
-def normalize_decision(decision):
-    if not isinstance(decision,dict): return {'action':'invalid'}
-    action = decision.get('action')
-    name = decision.get('tool_name')
-    if action in TOOLS: name = action
-    elif action not in ('tool','execute_flow','execute','call_tool','finish'): return {'action':'invalid'}
-    if action == 'finish': return {'action':'finish','answer':str(decision.get('answer',''))}
-    if name not in TOOLS: return {'action':'invalid'}
-    return {'action':'tool','tool_name':name,'arguments':decision.get('arguments',{})}
 
-def run_agent(task):
-    messages = [{'role':'system','content':SYSTEM_PROMPT},{'role':'user','content':task}]
-    discovered = set()
-    successful = {}
-    verified = set()
-    observations = []
-    # These task types are a narrow demo contract, not general natural-language intent detection.
-    requires_write = any(word in task.lower() for word in ('save','process','store','insert','add to the database'))
-    for step in range(1,MAX_STEPS+1):
+def normalize_decision(decision):
+    if not isinstance(decision, dict):
+        return {'action': 'invalid', 'message': 'Response is not an object'}
+    action = decision.get('action')
+    if action == 'finish':
+        return {'action': 'finish', 'answer': str(decision.get('answer', ''))}
+    name = action if action in TOOLS else decision.get('tool_name')
+    if action not in TOOLS and action not in ('tool', 'execute_flow', 'execute', 'call_tool'):
+        return {'action': 'invalid', 'message': 'Unrecognized action'}
+    if name not in TOOLS:
+        return {'action': 'invalid', 'message': 'Unknown tool'}
+    return {'action': 'tool', 'tool_name': name, 'arguments': decision.get('arguments', {})}
+
+
+def validate_args(name, args):
+    expected = ARGUMENTS[name]
+    if not isinstance(args, dict) or set(args) != set(expected):
+        return 'Arguments must contain exactly: ' + ', '.join(expected)
+    for key, kind in expected.items():
+        if not isinstance(args[key], kind) or not args[key].strip():
+            return f'{key} must be a nonempty string'
+    return None
+
+
+def parse_goal(task):
+    """Explicitly support a narrow task contract; never guess a different objective."""
+    write = bool(re.search(r'\b(save|process|store|insert)\b', task, re.I))
+    latest = bool(re.search(r'\blatest\b', task, re.I))
+    match = re.search(r'\b(?:from|for)\s+([\w .&-]+?)(?=\s+(?:and|invoice|to|into|in the|with|then|please|$)|[.,!?]|$)', task, re.I)
+    if latest and match:
+        company = match.group(1).strip()
+        if company:
+            return {'kind': 'latest', 'company': company, 'write': write}
+    file_match = re.search(r'\b(INV-[\w-]+\.pdf)\b', task, re.I)
+    if file_match and write:
+        return {'kind': 'specific', 'filename': file_match.group(1), 'write': True}
+    return {'kind': 'unsupported', 'write': write}
+
+
+def verify_goal(goal, state):
+    """Re-read trusted source and DB, independent of the LLM's finish message."""
+    if goal['kind'] == 'unsupported':
+        return {'verified': False, 'reason': 'Task outside supported invoice workflows'}
+    if goal['kind'] == 'latest':
+        result = find_latest_invoice(goal['company'])
+        if result['status'] != 'success':
+            return {'verified': False, 'reason': result.get('message', 'Latest invoice unavailable')}
+        expected = result['invoice']
+        if not goal['write']:
+            seen = state.get('latest_seen')
+            ok = bool(seen and seen.get('invoice_id') == expected['invoice_id'] and
+                      seen.get('company', '').casefold() == goal['company'].casefold())
+            return {'verified': ok, 'reason': 'Latest invoice confirmed' if ok else 'Latest invoice not discovered',
+                    'invoice_id': expected['invoice_id'] if ok else None}
+        filename = expected['filename']
+    else:
+        filename = goal['filename']
+        source_result = read_invoice(filename)
+        if source_result['status'] != 'success':
+            return {'verified': False, 'reason': 'Requested source file unavailable'}
+        try:
+            expected = extract_invoice_fields(source_result['content'])
+        except (ValueError, TypeError, ArithmeticError):
+            return {'verified': False, 'reason': 'Requested source file invalid'}
+    if filename not in state['processed_files']:
+        return {'verified': False, 'reason': 'Correct source invoice was not processed'}
+    db_result = get_invoice(expected['invoice_id'])
+    ok = db_result['status'] == 'success' and matching(db_result['data'], expected)
+    return {'verified': ok, 'reason': 'Goal and database independently verified' if ok else 'Database does not match goal invoice',
+            'invoice_id': expected['invoice_id']}
+
+
+def run_agent(task, llm=ask_llm, max_steps=MAX_STEPS):
+    task_id = str(uuid.uuid4())[:8]
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f'{task_id}.jsonl'
+    goal = parse_goal(task)
+    state = {'discovered': set(), 'processed_files': set(), 'latest_seen': None,
+             'failures': {}, 'steps': 0}
+    messages = [{'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': task + '\nSupported task contract: ' + json.dumps(goal)}]
+
+    def record(event, **details):
+        with log_path.open('a', encoding='utf-8') as out:
+            out.write(json.dumps({'time': datetime.now(timezone.utc).isoformat(),
+                                  'task_id': task_id, 'event': event, **details}, default=str) + '\n')
+
+    def end(status, reason, verification=None):
+        result = {'task_id': task_id, 'status': status, 'reason': reason,
+                  'verification': verification or {'verified': False}, 'log': str(log_path)}
+        record('end', result=result)
+        print('\nTASK', status.upper() + ':', reason)
+        if verification and verification.get('verified'):
+            print('INDEPENDENTLY VERIFIED:', verification['invoice_id'])
+        print('AUDIT LOG:', log_path)
+        return result
+
+    record('start', task=task, goal=goal)
+    if goal['kind'] == 'unsupported':
+        return end('unsupported', 'This version supports latest-company invoice lookup/processing and explicit invoice processing only')
+
+    for step in range(1, max_steps + 1):
+        state['steps'] = step
         print(f'\n========== STEP {step} ==========')
-        try: decision = normalize_decision(ask_llm(messages))
-        except (requests.RequestException,ValueError,KeyError) as exc:
-            print('LLM ERROR:',exc); return
-        print('AGENT DECISION:',decision)
-        messages.append({'role':'assistant','content':json.dumps(decision)})
+        try:
+            decision = normalize_decision(llm(messages))
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            record('model_error', error=type(exc).__name__, detail=str(exc))
+            return end('failed', 'Model response failed: ' + type(exc).__name__)
+        print('AGENT DECISION:', decision)
+        record('decision', step=step, decision=decision)
+        messages.append({'role': 'assistant', 'content': json.dumps(decision)})
         if decision['action'] == 'finish':
-            if requires_write and not verified:
-                # Explicit failure is allowed; never mislabel as completed.
-                print('\nTASK NOT VERIFIED:',decision.get('answer',''))
-                return
-            if not observations:
-                messages.append({'role':'user','content':'No tools used. Select a relevant tool first.'})
-                continue
-            print('\nTASK FINISHED:',decision.get('answer',''))
-            if verified: print('INDEPENDENTLY VERIFIED:',sorted(verified))
-            return
+            verification = verify_goal(goal, state)
+            if verification['verified']:
+                return end('completed', decision.get('answer') or 'Requested outcome verified', verification)
+            # Never allow an LLM's finish statement to override the verifier.
+            return end('unverified', verification['reason'], verification)
+
         if decision['action'] != 'tool':
-            observation = {'status':'error','message':'Invalid action; use action=tool and a registered tool_name'}
+            observation = {'status': 'error', 'message': decision.get('message', 'Invalid action')}
+            key = 'invalid'
         else:
-            name = decision['tool_name']; args = decision['arguments']
-            if not isinstance(args,dict):
-                observation = {'status':'error','message':'Arguments must be a JSON object'}
-            elif name in ('read_invoice','process_invoice') and args.get('filename') not in discovered:
-                observation = {'status':'error','message':'File not discovered; use list_files or find_latest_invoice first'}
+            name, args = decision['tool_name'], decision['arguments']
+            key = json.dumps([name, args], sort_keys=True, default=str)
+            validation = validate_args(name, args)
+            if validation:
+                observation = {'status': 'error', 'message': validation}
+            elif name in ('read_invoice', 'process_invoice') and args['filename'] not in state['discovered']:
+                observation = {'status': 'error', 'message': 'File not discovered; call list_files or find_latest_invoice first'}
+            elif name == 'process_invoice' and goal['kind'] == 'latest' and (
+                    not state['latest_seen'] or args['filename'] != state['latest_seen'].get('filename')):
+                observation = {'status': 'error', 'message': 'Must process filename returned by latest-invoice lookup'}
+            elif name == 'process_invoice' and goal['kind'] == 'specific' and args['filename'] != goal['filename']:
+                observation = {'status': 'error', 'message': 'Filename differs from requested invoice'}
+            elif name == 'find_latest_invoice' and goal['kind'] == 'latest' and args['company'].casefold() != goal['company'].casefold():
+                observation = {'status': 'error', 'message': 'Company differs from requested company'}
             else:
-                key = json.dumps([name,args],sort_keys=True)
-                if key in successful:
-                    observation = {**successful[key],'cached':True}
-                else:
-                    try: observation = TOOLS[name](**args)
-                    except (TypeError,ValueError,OSError) as exc: observation = {'status':'error','message':str(exc)}
-                    if observation.get('status') == 'success': successful[key] = observation
+                try:
+                    observation = TOOLS[name](**args)
+                except (TypeError, ValueError, OSError) as exc:
+                    observation = {'status': 'error', 'message': type(exc).__name__ + ': ' + str(exc)}
+                if not isinstance(observation, dict):
+                    observation = {'status': 'error', 'message': 'Tool returned invalid response'}
                 if observation.get('status') == 'success':
-                    if name == 'list_files': discovered.update(observation.get('files',[]))
-                    if name == 'find_latest_invoice':
-                        filename = observation.get('invoice',{}).get('filename')
-                        if filename: discovered.add(filename)
-                    if name == 'process_invoice' and observation.get('verified') is True:
-                        verified.add(observation['invoice_id'])
-        print('TOOL OBSERVATION:',observation)
-        observations.append(observation)
-        messages.append({'role':'user','content':'Tool result: '+json.dumps(observation)+'\nSelect the next action based on this result.'})
-    print('\nSTEP LIMIT REACHED. Task completion not established.')
+                    if name == 'list_files':
+                        state['discovered'].update(observation.get('files', []))
+                    elif name == 'find_latest_invoice':
+                        found = observation.get('invoice', {})
+                        if found.get('filename'):
+                            state['discovered'].add(found['filename'])
+                            if goal['kind'] == 'latest' and args['company'].casefold() == goal['company'].casefold():
+                                state['latest_seen'] = found
+                    elif name == 'process_invoice' and observation.get('verified') is True:
+                        state['processed_files'].add(args['filename'])
+        if observation['status'] == 'error':
+            state['failures'][key] = state['failures'].get(key, 0) + 1
+            if state['failures'][key] >= 3:
+                record('observation', step=step, observation=observation)
+                return end('failed', 'Repeated failed action; stopped safely')
+        print('TOOL OBSERVATION:', observation)
+        record('observation', step=step, observation=observation)
+        messages.append({'role': 'user', 'content': 'Tool result: ' + json.dumps(observation) + '\nChoose next action. Only finish if the requested goal is complete.'})
+    return end('failed', 'Step limit reached without verified completion')
+
 
 if __name__ == '__main__':
-    print('AutoFlow - Autonomous AI Task Worker')
+    print('AutoFlow v0.2 - Autonomous AI Task Worker')
     while True:
         task = input('\nEnter your task (or exit): ').strip()
-        if task.lower() == 'exit': break
-        if task: run_agent(task)
+        if task.lower() == 'exit':
+            break
+        if task:
+            run_agent(task)
