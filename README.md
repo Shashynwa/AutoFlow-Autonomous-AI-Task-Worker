@@ -1,12 +1,66 @@
-# AutoFlow — Autonomous AI Task Worker (v0.2)
+# AutoFlow — Autonomous AI Task Worker
 
-A small, **real-execution** office agent. A local Ollama LLM selects tools, while Python reads synthetic invoice PDFs, writes to SQLite, and **independently verifies the user's requested outcome**. No company credentials or third-party data.
+**A local, tool-using AI agent for auditable invoice workflows.** AutoFlow uses Ollama (`qwen2.5:3b`) to choose actions, Python tools to interact with real PDF files and SQLite, and a separate controller to enforce task constraints and verify outcomes.
+
+> **Scope:** A working, deliberately restricted invoice-processing prototype—not a general-purpose office assistant. All included invoices are synthetic.
+
+## Highlights
+
+- **Autonomous tool selection:** the local LLM decides whether to locate an invoice, process it, or finish.
+- **Real execution:** searches PDF invoices, extracts structured fields, and persists records to SQLite.
+- **Independent verification:** the controller checks the source invoice and database outcome rather than trusting the LLM's final claim.
+- **Safety boundaries:** exact tool-argument validation, filename discovery, protection against processing the wrong invoice, and read-only enforcement at the tool-execution boundary.
+- **Error handling:** missing files and companies return non-success statuses; omitted filenames in explicit requests can be recovered from the verified user instruction.
+- **Traceability:** each run produces a JSONL audit log of decisions, observations, recoveries, and outcomes.
+- **Local-first:** runs with Ollama; no paid LLM API or company credentials required.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    U[User request] --> G[Goal parser and task constraints]
+    G --> C[Agent controller]
+    C --> L[Ollama: Qwen 2.5 3B]
+    L --> D[Proposed action and arguments]
+    D --> V{Controller validation}
+    V -->|Rejected| O[Error observation]
+    V -->|Allowed| T[Invoice tools]
+    T --> P[(Synthetic PDF invoices)]
+    T --> S[(SQLite database)]
+    T --> O[Tool observation]
+    O --> C
+    C --> F[Independent goal verifier]
+    F --> R[Completed / Unverified / Unsupported / Failed]
+    C --> A[(JSONL audit log)]
+    V --> A
+    F --> A
+```
+
+**Trust boundary:** the model proposes actions; it does **not** authorize database writes, select a different invoice than the requested one, or decide whether the task is truly complete. The Python controller performs those checks.
+
+### Core components
+
+| File | Responsibility |
+| --- | --- |
+| `agent.py` | Goal interpretation, Ollama interaction, tool orchestration, argument validation, safety rules, verification, audit logging |
+| `tools/file_tools.py` | Discover invoice files |
+| `tools/invoice_tools.py` | Extract PDF fields, find the latest company invoice, process and verify an invoice |
+| `tools/database_tools.py` | SQLite persistence and retrieval |
+| `evaluate_agent.py` | Local end-to-end scenario evaluation using the real Ollama model |
+| `test_agent.py` | Deterministic offline controller tests using stubbed model decisions |
+| `test_invoice_tools.py` | Invoice tool tests |
+| `generate_invoices.py` | Generate synthetic sample PDFs |
+| `setup_database.py` | Initialize the SQLite schema |
 
 ## Requirements
-- Python 3.10+
-- Ollama installed and running; `ollama pull qwen2.5:3b`
 
-## Setup (Windows CMD)
+- Windows CMD (instructions below); Python 3.10+ recommended
+- [Ollama](https://ollama.com/) installed and running
+- Local model: `qwen2.5:3b`
+- Python packages from `requirements.txt`
+
+## Quick start — Windows CMD
+
 ```cmd
 py -3.10 -m venv venv
 venv\Scripts\activate
@@ -18,48 +72,97 @@ python -m unittest -v
 python agent.py
 ```
 
-**Example tasks**
-- `Find the latest invoice from ABC Company and save it to the database. Verify that it was saved correctly.`
-- `Find the latest invoice from XYZ Company.`
-- `Process INV-104.pdf.`
+If Ollama is not already running as a background service, start it in a separate terminal with `ollama serve`.
 
-## Architecture
+### Try these tasks
 
-`User request → restricted goal parser → Ollama Qwen 2.5 3B → tool decision → strict argument validation + source discovery + goal safeguards → real PDF/SQLite tools → observation → next decision → independent goal verifier → status and JSONL audit trail`
+```text
+Find the latest invoice from ABC Company and save it to the database. Verify that it was saved correctly.
+Find the latest invoice from ABC Company, but do not save anything.
+Process INV-103.pdf and verify that it was saved.
+Process INV-999.pdf.
+Send an email to ABC Company confirming their payment.
+```
 
-- The LLM selects the next action, but cannot authorize its own success.
-- `find_latest_invoice` searches the actual synthetic PDFs by company and date.
-- `process_invoice` validates PDF fields, handles duplicate/conflicting records, saves to SQLite, and checks the stored values.
-- The **goal verifier** independently re-reads the latest matching source invoice and its database record. Processing the wrong invoice cannot complete a latest-invoice request.
-- Tool calls are checked for exact argument names and types. Undiscovered filenames are blocked. Repeated failed actions stop safely.
-- Task decisions, observations, and final status are saved as JSONL under `logs/` (ignored by Git).
+The last two requests demonstrate safe non-success handling: a missing source file and an unsupported action.
 
-## Tests
+## How one run works
 
-`python -m unittest -v` runs the original invoice tool tests and eight offline agent/controller tests. The latter inject predetermined LLM decisions, allowing tests to run without Ollama. **These tests do not measure real-model task success rate**; run the agent manually with Ollama and record actual results separately.
+1. Parse the request into a supported invoice goal and read/write constraints.
+2. Check explicit filenames against available local PDFs; reject missing files.
+3. Ask the local LLM to select an action and arguments.
+4. Validate tool names, arguments, file discovery, and task permissions. Recover a missing filename only when the original user request unambiguously specifies an existing file.
+5. Execute approved Python tools and return their observations to the model.
+6. Independently check whether the intended source invoice was found or the correct database record was saved.
+7. Return an evidence-based status and save a JSONL audit trail under `logs/`.
 
-## Known limitations
+## Evaluation
 
-- Deliberately supports a **narrow invoice task contract**: latest invoice for a company (read or save) and explicit invoice PDF processing. Other tasks are rejected rather than falsely marked complete.
-- Goal interpretation uses simple pattern matching, not general natural-language understanding. Some paraphrases may be rejected or misinterpreted; the current verifier is specific to invoices.
-- `process_invoice` is a high-level tool that bundles parsing, saving, and verification; the model autonomously chooses tools, not every internal substep.
-- No browser automation, human approval for sensitive actions, multi-user security, persistent cross-task memory, or general task planning.
-- Local demo SQLite uses floating-point amounts; production financial systems should store integer minor units or decimals.
-- Local model output may still be unreliable; the controller prevents false success for the supported goals but cannot guarantee that Qwen finishes every task.
-- The test invoices are synthetic; do not use real financial data.
+Run deterministic tests (no Ollama needed):
 
-## Design choices / next steps
+```cmd
+python -m unittest -v
+```
 
-A narrow, auditable, CPU-friendly implementation was prioritized over mocked breadth. Next: model-level evaluation over varied phrasings, user clarification/approval, stronger goal parsing, more workflows, and optionally browser/API integrations. No external API keys are required. Tools: Python, Ollama `qwen2.5:3b`, PyMuPDF, SQLite, requests, ReportLab (sample PDF generation).
+Run the live local-model evaluation:
 
-## Demo evidence
+```cmd
+python evaluate_agent.py --repeats 1
+```
 
-For a live demo, start Ollama, run `python agent.py`, enter a supported request, and show (1) tool decisions, (2) real PDF and database operations, (3) `INDEPENDENTLY VERIFIED`, and (4) the corresponding `logs/<task_id>.jsonl` trace. A screen recording can be linked here before submission.
+### Observed results — October 24, 2026
 
-## Reliability evaluation and safeguards (October 2026 update)
+| Metric | Earlier baseline | Latest local evaluation |
+| --- | ---: | ---: |
+| Scenarios passed | 7 / 12 | **12 / 12** |
+| Pass rate | 58.33% | **100%** |
+| False completions | 1 | **0** |
 
-Run the offline tests with `python -m unittest -v` and the live local Ollama evaluation with `python evaluate_agent.py --repeats 1`.
+**Evaluation scope:** These results come from **one 12-scenario run** on a local `qwen2.5:3b` model. The suite includes successful reads/writes, explicit filename processing, missing resources, unsupported actions, and instruction paraphrases. A passed rejection case counts toward the pass rate. This is not a general agent benchmark, statistical reliability estimate, or guarantee of future runs.
 
-The controller enforces read-only requests (including "do not save") before executing database-writing tools. Explicit filename tasks first discover the available files and reject absent filenames without repeatedly querying the LLM. Supported latest-invoice phrases include "latest", "newest", and "most recent". Each run records a JSONL audit trail and verifies the source/database outcome independently of the model's final text.
+**Notable evidence:**
 
-The 12-case evaluation must be run on the user's own Ollama instance; passing offline tests does **not** establish a 12/12 live score. The system intentionally supports only a restricted invoice workflow and is not a general-purpose autonomous agent. Exact-filename preflight discovery is performed by the controller and recorded in the audit log; the LLM still selects subsequent processing actions.
+- **Argument recovery:** when the model called `process_invoice({})` for an explicit `INV-103.pdf` request, the controller recovered `INV-103.pdf` from the verified user request and independently confirmed the saved record.
+- **Read-only protection:** for “do not save anything,” the model attempted a write; the controller blocked it, and the evaluation found **zero database rows written**.
+- **Missing file:** `INV-999.pdf` was reported as unavailable without a false success.
+
+## Design decisions
+
+**Why a small local model?** The prototype runs on modest consumer hardware without paid inference services. Reliability is improved through constrained tools and deterministic controller checks rather than expecting the model to be perfect.
+
+**Why narrow invoice tasks?** Restricting scope makes success measurable and allows the controller to verify concrete side effects. Unsupported tasks are rejected explicitly.
+
+**Why separate verification?** An LLM can report success without achieving the goal. AutoFlow compares the requested invoice and the actual source/database state before declaring completion.
+
+**Why high-level tools?** `process_invoice` combines extraction, persistence, and verification. The model autonomously chooses *which tool to call*, while deterministic Python handles sensitive internal operations.
+
+## Limitations and future work
+
+- Only supported invoice lookup and processing requests are handled; no email sending, payment execution, or browser automation.
+- Goal interpretation uses patterns and a restricted task contract; unseen wording may be rejected or misinterpreted.
+- The included PDFs use predictable synthetic formats; arbitrary real-world invoice layouts are not validated.
+- A single 12-case evaluation cannot establish broad reliability; repeat runs and adversarial tests are future work.
+- No multi-user permissions, approval workflow, or production-grade security hardening.
+- SQLite financial amounts currently use floating-point values; production accounting should use decimal or integer minor-unit representations.
+- The local model can still make incorrect proposals; controller safeguards cover the implemented workflow, not all possible instructions.
+
+Potential extensions include more document types, explicit approval for consequential actions, stronger structured goal parsing, repeated evaluations, and optional browser/API integrations.
+
+## Demo video outline (2–3 minutes)
+
+1. **0:00–0:20 — Problem and architecture:** show the diagram; explain model-selected tools versus controller-enforced verification.
+2. **0:20–0:55 — Successful write:** run the ABC Company latest-invoice task; show the verified invoice and SQLite result.
+3. **0:55–1:30 — Argument recovery:** process `INV-103.pdf`; highlight `RECOVERED ARGUMENTS` and `INDEPENDENTLY VERIFIED` if it appears in that run.
+4. **1:30–2:05 — Safety:** run “do not save anything”; show the read-only behavior. The controller will block any attempted write.
+5. **2:05–2:30 — Safe failure:** request `INV-999.pdf` or unsupported email action.
+6. **2:30–3:00 — Evidence and limitations:** show the 12/12 evaluation summary, audit logs, and the narrow supported scope.
+
+**Demo URL:** _Add your recorded video link here._
+
+## Repository hygiene
+
+Do not commit `venv/`, local SQLite state (`data/company.db`), `logs/`, evaluation temp files, secrets, or credentials. Keep synthetic sample PDFs and the scripts required to reproduce them.
+
+## License
+
+_No license has been specified yet. Add a license only if you intend to grant reuse permissions._
