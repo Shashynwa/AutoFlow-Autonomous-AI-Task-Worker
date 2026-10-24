@@ -56,7 +56,7 @@ def normalize_decision(decision):
 def validate_args(name, args):
     expected = ARGUMENTS[name]
     if not isinstance(args, dict) or set(args) != set(expected):
-        return 'Arguments must contain exactly: ' + ', '.join(expected)
+        return ('Tool ' + name + ' accepts no arguments' if not expected else 'Arguments must contain exactly: ' + ', '.join(expected))
     for key, kind in expected.items():
         if not isinstance(args[key], kind) or not args[key].strip():
             return f'{key} must be a nonempty string'
@@ -64,17 +64,30 @@ def validate_args(name, args):
 
 
 def parse_goal(task):
-    """Explicitly support a narrow task contract; never guess a different objective."""
-    write = bool(re.search(r'\b(save|process|store|insert)\b', task, re.I))
-    latest = bool(re.search(r'\blatest\b', task, re.I))
-    match = re.search(r'\b(?:from|for)\s+([\w .&-]+?)(?=\s+(?:and|invoice|to|into|in the|with|then|please|$)|[.,!?]|$)', task, re.I)
-    if latest and match:
-        company = match.group(1).strip()
+    """Parse supported invoice intents and prioritize explicit no-write constraints."""
+    text = task.strip()
+    lower = text.casefold()
+    # Negative instructions override positive verbs such as "save".
+    no_write = bool(re.search(r"\b(?:do\s+not|don't|dont|never|without)\s+(?:\w+\s+){0,3}?(?:save|store|insert|process|write|modify|update)\b", lower))
+    write = bool(re.search(r'\b(save|process|store|insert|record)\b', lower)) and not no_write
+    latest = bool(re.search(r'\b(?:latest|newest|most\s+recent)\b', lower))
+    # Specific filename takes precedence; never turn it into an unrelated company search.
+    file_match = re.search(r'\b(INV-[A-Za-z0-9_-]+\.pdf)\b', text, re.I)
+    if file_match and not latest and write:
+        return {'kind': 'specific', 'filename': file_match.group(1), 'write': True}
+    if latest:
+        # Company possessive: "ABC Company's most recent invoice"
+        possessive = re.search(r"\b([A-Za-z0-9][A-Za-z0-9 .&-]*?\s+Company)\s*['’]s\b", text, re.I)
+        company = possessive.group(1).strip() if possessive else None
+        if company:
+            company = re.sub(r'^(?:locate|find|show|give|retrieve|identify)\s+', '', company, flags=re.I)
+        if not company:
+            # "from ABC Company", "for XYZ Company", or "for NoSuchCompany"
+            match = re.search(r'\b(?:from|for)\s+([\w .&-]+?)(?=\s+(?:and|invoice|to|into|in the|with|then|please|but|$)|[.,!?]|$)', text, re.I)
+            if match:
+                company = match.group(1).strip()
         if company:
             return {'kind': 'latest', 'company': company, 'write': write}
-    file_match = re.search(r'\b(INV-[\w-]+\.pdf)\b', task, re.I)
-    if file_match and write:
-        return {'kind': 'specific', 'filename': file_match.group(1), 'write': True}
     return {'kind': 'unsupported', 'write': write}
 
 
@@ -89,7 +102,7 @@ def verify_goal(goal, state):
         expected = result['invoice']
         if not goal['write']:
             seen = state.get('latest_seen')
-            ok = bool(seen and seen.get('invoice_id') == expected['invoice_id'] and
+            ok = not state['processed_files'] and bool(seen and seen.get('invoice_id') == expected['invoice_id'] and
                       seen.get('company', '').casefold() == goal['company'].casefold())
             return {'verified': ok, 'reason': 'Latest invoice confirmed' if ok else 'Latest invoice not discovered',
                     'invoice_id': expected['invoice_id'] if ok else None}
@@ -140,6 +153,18 @@ def run_agent(task, llm=ask_llm, max_steps=MAX_STEPS):
     if goal['kind'] == 'unsupported':
         return end('unsupported', 'This version supports latest-company invoice lookup/processing and explicit invoice processing only')
 
+    # Deterministic source discovery for exact filenames. This is a real tool call,
+    # recorded in the audit trail, and avoids LLM hallucinations during recovery.
+    if goal['kind'] == 'specific':
+        discovery = list_files()
+        record('preflight_discovery', observation=discovery)
+        if discovery.get('status') != 'success':
+            return end('unverified', 'Unable to list invoice files')
+        state['discovered'].update(discovery['files'])
+        if goal['filename'] not in state['discovered']:
+            return end('unverified', f"Requested invoice file not found: {goal['filename']}")
+        messages.append({'role': 'user', 'content': 'Verified file discovery: ' + json.dumps(discovery) + '. The requested filename exists. Process only the requested filename.'})
+
     for step in range(1, max_steps + 1):
         state['steps'] = step
         print(f'\n========== STEP {step} ==========')
@@ -154,7 +179,12 @@ def run_agent(task, llm=ask_llm, max_steps=MAX_STEPS):
         if decision['action'] == 'finish':
             verification = verify_goal(goal, state)
             if verification['verified']:
-                return end('completed', decision.get('answer') or 'Requested outcome verified', verification)
+                invoice_id = verification['invoice_id']
+                if not goal['write']:
+                    summary = f'Located and verified {invoice_id}; no database changes made'
+                else:
+                    summary = f'Processed and independently verified {invoice_id} in the database'
+                return end('completed', summary, verification)
             # Never allow an LLM's finish statement to override the verifier.
             return end('unverified', verification['reason'], verification)
 
@@ -163,17 +193,45 @@ def run_agent(task, llm=ask_llm, max_steps=MAX_STEPS):
             key = 'invalid'
         else:
             name, args = decision['tool_name'], decision['arguments']
+
+            # Recover missing filename for an explicit invoice-processing task.
+            # Only use the filename extracted from the original user request.
+            if (
+                name == 'process_invoice'
+                and goal['kind'] == 'specific'
+                and goal['write']
+                and isinstance(args, dict)
+                and 'filename' not in args
+                and goal['filename'] in state['discovered']
+            ):
+                args = {'filename': goal['filename']}
+
+                # Keep the corrected decision in the audit log.
+                record(
+                    'argument_recovery',
+                    step=step,
+                    tool=name,
+                    recovered_arguments=args,
+                    reason='Filename recovered from verified user request'
+                )
+
+                print('RECOVERED ARGUMENTS:', args)
+
             key = json.dumps([name, args], sort_keys=True, default=str)
             validation = validate_args(name, args)
             if validation:
                 observation = {'status': 'error', 'message': validation}
+            elif name == 'process_invoice' and not goal['write']:
+                observation = {'status': 'error', 'message': 'Read-only task: database writes are prohibited'}
+            elif name == 'process_invoice' and goal['kind'] == 'specific' and args['filename'] != goal['filename']:
+                observation = {'status': 'error', 'message': 'Filename differs from requested invoice'}
+            elif name == 'find_latest_invoice' and goal['kind'] == 'specific':
+                observation = {'status': 'error', 'message': 'Specific invoice task: use the requested filename, not a latest-company lookup'}
             elif name in ('read_invoice', 'process_invoice') and args['filename'] not in state['discovered']:
                 observation = {'status': 'error', 'message': 'File not discovered; call list_files or find_latest_invoice first'}
             elif name == 'process_invoice' and goal['kind'] == 'latest' and (
                     not state['latest_seen'] or args['filename'] != state['latest_seen'].get('filename')):
                 observation = {'status': 'error', 'message': 'Must process filename returned by latest-invoice lookup'}
-            elif name == 'process_invoice' and goal['kind'] == 'specific' and args['filename'] != goal['filename']:
-                observation = {'status': 'error', 'message': 'Filename differs from requested invoice'}
             elif name == 'find_latest_invoice' and goal['kind'] == 'latest' and args['company'].casefold() != goal['company'].casefold():
                 observation = {'status': 'error', 'message': 'Company differs from requested company'}
             else:

@@ -56,19 +56,10 @@ A narrow, auditable, CPU-friendly implementation was prioritized over mocked bre
 
 For a live demo, start Ollama, run `python agent.py`, enter a supported request, and show (1) tool decisions, (2) real PDF and database operations, (3) `INDEPENDENTLY VERIFIED`, and (4) the corresponding `logs/<task_id>.jsonl` trace. A screen recording can be linked here before submission.
 
-## Live Ollama evaluation (optional)
+## Reliability evaluation and safeguards (October 2026 update)
 
-With Ollama running and `qwen2.5:3b` available, run:
+Run the offline tests with `python -m unittest -v` and the live local Ollama evaluation with `python evaluate_agent.py --repeats 1`.
 
-```bash
-python evaluate_agent.py --repeats 1
-```
+The controller enforces read-only requests (including "do not save") before executing database-writing tools. Explicit filename tasks first discover the available files and reject absent filenames without repeatedly querying the LLM. Supported latest-invoice phrases include "latest", "newest", and "most recent". Each run records a JSONL audit trail and verifies the source/database outcome independently of the model's final text.
 
-This runs 12 natural-language scenarios, including known paraphrase limitations. It
-creates an isolated temporary SQLite database for each scenario and **does not
-modify your `data/company.db`**. Results and full agent transcripts are saved to
-`evaluation_results/eval_<timestamp>.json`. Some paraphrase tests are expected
-to expose weaknesses in v0.2; don't present the evaluation as 100% passing
-without running it. For repeated-run measurements use `--repeats 2` (24 runs).
-Each Ollama request can take time on CPU. The evaluation's pass rate includes
-expected rejections; it is not a measure of unrestricted generalization.
+The 12-case evaluation must be run on the user's own Ollama instance; passing offline tests does **not** establish a 12/12 live score. The system intentionally supports only a restricted invoice workflow and is not a general-purpose autonomous agent. Exact-filename preflight discovery is performed by the controller and recorded in the audit log; the LLM still selects subsequent processing actions.
