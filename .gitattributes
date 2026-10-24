@@ -1,0 +1,14 @@
+# Automatically handle text file line endings
+* text=auto
+
+# Python and documentation files
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Binary files - never modify line endings
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.db binary
