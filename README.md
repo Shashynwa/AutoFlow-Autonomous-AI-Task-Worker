@@ -153,7 +153,3 @@ Potential extensions include more document types, explicit approval for conseque
 ## Repository hygiene
 
 Do not commit `venv/`, local SQLite state (`data/company.db`), `logs/`, evaluation temp files, secrets, or credentials. Keep synthetic sample PDFs and the scripts required to reproduce them.
-
-## License
-
-_No license has been specified yet. Add a license only if you intend to grant reuse permissions._
