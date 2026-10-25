@@ -40,17 +40,17 @@ flowchart TD
 
 ### Core components
 
-| File | Responsibility |
-| --- | --- |
-| `agent.py` | Goal interpretation, Ollama interaction, tool orchestration, argument validation, safety rules, verification, audit logging |
-| `tools/file_tools.py` | Discover invoice files |
-| `tools/invoice_tools.py` | Extract PDF fields, find the latest company invoice, process and verify an invoice |
-| `tools/database_tools.py` | SQLite persistence and retrieval |
-| `evaluate_agent.py` | Local end-to-end scenario evaluation using the real Ollama model |
-| `test_agent.py` | Deterministic offline controller tests using stubbed model decisions |
-| `test_invoice_tools.py` | Invoice tool tests |
-| `generate_invoices.py` | Generate synthetic sample PDFs |
-| `setup_database.py` | Initialize the SQLite schema |
+| File                      | Responsibility                                                                                                              |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `agent.py`                | Goal interpretation, Ollama interaction, tool orchestration, argument validation, safety rules, verification, audit logging |
+| `tools/file_tools.py`     | Discover invoice files                                                                                                      |
+| `tools/invoice_tools.py`  | Extract PDF fields, find the latest company invoice, process and verify an invoice                                          |
+| `tools/database_tools.py` | SQLite persistence and retrieval                                                                                            |
+| `evaluate_agent.py`       | Local end-to-end scenario evaluation using the real Ollama model                                                            |
+| `test_agent.py`           | Deterministic offline controller tests using stubbed model decisions                                                        |
+| `test_invoice_tools.py`   | Invoice tool tests                                                                                                          |
+| `generate_invoices.py`    | Generate synthetic sample PDFs                                                                                              |
+| `setup_database.py`       | Initialize the SQLite schema                                                                                                |
 
 ## Requirements
 
@@ -112,11 +112,11 @@ python evaluate_agent.py --repeats 1
 
 ### Observed results — October 24, 2026
 
-| Metric | Earlier baseline | Latest local evaluation |
-| --- | ---: | ---: |
-| Scenarios passed | 7 / 12 | **12 / 12** |
-| Pass rate | 58.33% | **100%** |
-| False completions | 1 | **0** |
+| Metric            | Earlier baseline | Latest local evaluation |
+| ----------------- | ---------------: | ----------------------: |
+| Scenarios passed  |           7 / 12 |             **12 / 12** |
+| Pass rate         |           58.33% |                **100%** |
+| False completions |                1 |                   **0** |
 
 **Evaluation scope:** These results come from **one 12-scenario run** on a local `qwen2.5:3b` model. The suite includes successful reads/writes, explicit filename processing, missing resources, unsupported actions, and instruction paraphrases. A passed rejection case counts toward the pass rate. This is not a general agent benchmark, statistical reliability estimate, or guarantee of future runs.
 
@@ -134,7 +134,7 @@ python evaluate_agent.py --repeats 1
 
 **Why separate verification?** An LLM can report success without achieving the goal. AutoFlow compares the requested invoice and the actual source/database state before declaring completion.
 
-**Why high-level tools?** `process_invoice` combines extraction, persistence, and verification. The model autonomously chooses *which tool to call*, while deterministic Python handles sensitive internal operations.
+**Why high-level tools?** `process_invoice` combines extraction, persistence, and verification. The model autonomously chooses _which tool to call_, while deterministic Python handles sensitive internal operations.
 
 ## Limitations and future work
 
@@ -148,16 +148,7 @@ python evaluate_agent.py --repeats 1
 
 Potential extensions include more document types, explicit approval for consequential actions, stronger structured goal parsing, repeated evaluations, and optional browser/API integrations.
 
-## Demo video outline (2–3 minutes)
-
-1. **0:00–0:20 — Problem and architecture:** show the diagram; explain model-selected tools versus controller-enforced verification.
-2. **0:20–0:55 — Successful write:** run the ABC Company latest-invoice task; show the verified invoice and SQLite result.
-3. **0:55–1:30 — Argument recovery:** process `INV-103.pdf`; highlight `RECOVERED ARGUMENTS` and `INDEPENDENTLY VERIFIED` if it appears in that run.
-4. **1:30–2:05 — Safety:** run “do not save anything”; show the read-only behavior. The controller will block any attempted write.
-5. **2:05–2:30 — Safe failure:** request `INV-999.pdf` or unsupported email action.
-6. **2:30–3:00 — Evidence and limitations:** show the 12/12 evaluation summary, audit logs, and the narrow supported scope.
-
-**Demo URL:** _Add your recorded video link here._
+**Demo URL:** [Watch Demo Video](https://drive.google.com/file/d/1kndATH4XYEnUVRnxFl4XEhGckziUTnrH/view?usp=sharing)
 
 ## Repository hygiene
 
